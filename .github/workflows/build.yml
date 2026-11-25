@@ -1,0 +1,811 @@
+name: Build APK Android
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Décompresser le zip si le projet est envoyé en .zip
+        run: |
+          echo "=== Contenu du dépôt ==="
+          find . -maxdepth 3 -not -path "./.git/*" | sort
+          if [ ! -f package.json ]; then
+            ZIP=$(find . -maxdepth 3 -iname "*.zip" -not -path "./.git/*" | head -n 1 || true)
+            if [ -z "$ZIP" ]; then
+              echo "ERREUR : aucun package.json ni fichier .zip dans le dépôt"
+              exit 1
+            fi
+            echo "Extraction de $ZIP"
+            unzip -q -o "$ZIP" -d . || true
+          fi
+          if [ ! -f package.json ]; then
+            PKG=$(find . -maxdepth 4 -name package.json -not -path "*/node_modules/*" | head -n 1 || true)
+            if [ -z "$PKG" ]; then echo "ERREUR : package.json introuvable après extraction"; exit 1; fi
+            DIR=$(dirname "$PKG")
+            echo "Projet trouvé dans $DIR"
+            cp -a "$DIR"/. .
+          fi
+          echo "=== Racine du projet ==="
+          ls -la
+
+      - name: Installer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Installer Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Installer les dépendances
+        run: npm install
+
+      - name: Installer les plugins de notifications
+        run: npm install "@capacitor/local-notifications@^6.0.0" "@capacitor/preferences@^6.0.0"
+
+      - name: Ajouter les notifications au code web
+        run: |
+          set -e
+          cat > www/notifications.js <<'JS_NOTIF'
+          // =====================================================================
+          //  NOTIFICATIONS — rappels de cours + alerte de synchronisation
+          //  (module séparé : ne touche pas à la logique de app.js, qui l'appelle via SekNotif.*)
+          //   • Rappel 10 min avant chaque bloc de cours, planifié sur l'alarme du téléphone
+          //     (sonne même app fermée), recalculé à chaque synchronisation de l'emploi du temps
+          //   • « Connecté au serveur : synchronisez vos notes » quand des notes attendent
+          //     (app ouverte : ici ; app fermée : SyncWatcher.java, toutes les ~15 min)
+          // =====================================================================
+          (function () {
+              "use strict";
+
+              const CH_COURS = "cours_v1";            // canaux créés côté natif (MainActivity)
+              const CH_SYNC = "sync_v1";
+              const SOUND = "alerte.wav";
+              const SMALL_ICON = "ic_stat_notify";    // icône cloche (vecteur) créée au build
+              const ID_BASE = 1000;                   // ids 1000..1999 = rappels de cours
+              const ID_SYNC = 9002;
+              const LEAD_MIN = 10;
+
+              let LN = null, PREFS = null;
+              let syncShownThisSession = false;
+              let lastPushedPending = null;
+
+              // --- outils ---------------------------------------------------------
+              function isNative() {
+                  const c = window.Capacitor;
+                  return !!(c && typeof c.isNativePlatform === "function" && c.isNativePlatform());
+              }
+              function plugin(name) {
+                  const c = window.Capacitor;
+                  if (!c) return null;
+                  try { if (c.Plugins && c.Plugins[name]) return c.Plugins[name]; } catch (e) { /* ok */ }
+                  try { if (typeof c.registerPlugin === "function") return c.registerPlugin(name); } catch (e) { /* ok */ }
+                  return null;
+              }
+              function ls(key) { try { const v = localStorage.getItem(key); return v === null ? null : JSON.parse(v); } catch (e) { return null; } }
+              const pad = n => String(n).padStart(2, "0");
+
+              async function setPref(key, value) {
+                  if (!PREFS) return;
+                  try { await PREFS.set({ key, value: String(value) }); } catch (e) { /* ignoré */ }
+              }
+
+              // --- permissions -----------------------------------------------------
+              let permPromise = null;
+              function ensurePermissions() {            // une seule demande à la fois (évite 2 fenêtres d'autorisation)
+                  if (!permPromise) permPromise = doEnsurePermissions().finally(() => { permPromise = null; });
+                  return permPromise;
+              }
+              async function doEnsurePermissions() {
+                  if (!LN) return false;
+                  try {
+                      let p = await LN.checkPermissions();
+                      if (p.display !== "granted") p = await LN.requestPermissions();   // Android 13+ : fenêtre d'autorisation
+                      // Alarmes exactes (Android 12+) : pour que le rappel sonne pile à l'heure
+                      if (typeof LN.checkExactNotificationSetting === "function" && !ls("sekolify_exact_asked")) {
+                          const e = await LN.checkExactNotificationSetting();
+                          if (e && e.exact_alarm === "denied") {
+                              localStorage.setItem("sekolify_exact_asked", "true");
+                              if (confirm("Pour que les rappels de cours sonnent à l'heure exacte, autorisez « Alarmes et rappels » pour cette application sur l'écran suivant.")) {
+                                  await LN.changeExactNotificationSetting();
+                              }
+                          }
+                      }
+                      return p.display === "granted";
+                  } catch (e) { return false; }
+              }
+
+              // --- rappels de cours --------------------------------------------------
+              // même regroupement que l'écran Emploi du temps : 8h + 9h => un seul bloc 08:00–10:00
+              function blocksOfDay(timetable, day) {
+                  const slots = (timetable || []).filter(s => s.day === day).sort((a, b) => a.hour - b.hour);
+                  const out = [];
+                  slots.forEach(s => {
+                      const last = out[out.length - 1];
+                      if (last && last.class_name === s.class_name && last.subject_name === s.subject_name && last.end === s.hour) last.end = s.hour + 1;
+                      else out.push({ class_name: s.class_name, subject_name: s.subject_name, start: s.hour, end: s.hour + 1 });
+                  });
+                  return out;
+              }
+
+              async function clearReminders() {
+                  const pend = await LN.getPending();
+                  const old = ((pend && pend.notifications) || [])
+                      .filter(n => n.id >= ID_BASE && n.id < ID_BASE + 1000).map(n => ({ id: n.id }));
+                  if (old.length) await LN.cancel({ notifications: old });
+              }
+
+              async function scheduleReminders(data) {
+                  if (!LN) return;
+                  try {
+                      if (!(await ensurePermissions())) return;
+                      await clearReminders();
+                      const tt = (data && data.timetable) || [];
+                      const notifications = [];
+                      for (let day = 0; day < 6; day++) {                       // 0 = lundi … 5 = samedi
+                          blocksOfDay(tt, day).forEach(b => {
+                              const total = b.start * 60 - LEAD_MIN;
+                              if (total < 0) return;
+                              notifications.push({
+                                  id: ID_BASE + day * 100 + b.start,
+                                  title: "Cours dans " + LEAD_MIN + " minutes",
+                                  body: b.class_name + " · " + b.subject_name + " — " + pad(b.start) + ":00 à " + pad(b.end) + ":00",
+                                  channelId: CH_COURS,
+                                  smallIcon: SMALL_ICON,
+                                  sound: SOUND,
+                                  schedule: { on: { weekday: day + 2, hour: Math.floor(total / 60), minute: total % 60 }, allowWhileIdle: true }
+                              });                                                // weekday : 1 = dimanche, 2 = lundi …
+                          });
+                      }
+                      if (notifications.length) await LN.schedule({ notifications });
+                  } catch (e) { /* ne casse jamais l'app */ }
+              }
+
+              // --- état partagé avec le service natif (SyncWatcher) --------------------
+              async function pushState(pending, reachable) {
+                  const ip = ls("sekolify_ip");
+                  await setPref("bg_ip", ip || "");
+                  await setPref("bg_port", typeof DISCOVERY_PORT !== "undefined" ? DISCOVERY_PORT : 47831);
+                  await setPref("bg_pending", pending);
+                  if (reachable !== undefined) await setPref("bg_last_reachable", reachable ? "1" : "0");
+              }
+
+              async function notifySyncNow(pending) {
+                  if (!LN) return;
+                  try {
+                      if (!(await ensurePermissions())) return;
+                      await LN.schedule({ notifications: [{
+                          id: ID_SYNC,
+                          title: "Connecté au serveur de l'école",
+                          body: pending + " note(s) non envoyée(s). Il est temps de synchroniser les notes de vos élèves.",
+                          channelId: CH_SYNC,
+                          smallIcon: SMALL_ICON,
+                          sound: SOUND
+                      }] });
+                  } catch (e) { /* ignoré */ }
+              }
+
+              // --- API appelée par app.js ----------------------------------------------
+              window.SekNotif = {
+                  // PC joint + emploi du temps à jour
+                  onConnected(data, pending) {
+                      try {
+                          if (!isNative()) return;
+                          scheduleReminders(data);
+                          lastPushedPending = pending;
+                          pushState(pending, true);                       // le PC répond : évite un doublon côté natif
+                          if (pending > 0 && !syncShownThisSession) {
+                              syncShownThisSession = true;
+                              notifySyncNow(pending);
+                          }
+                      } catch (e) { /* ignoré */ }
+                  },
+                  // PC injoignable : on pourra re-notifier à la prochaine connexion
+                  onOffline() {
+                      try {
+                          syncShownThisSession = false;
+                          if (isNative()) setPref("bg_last_reachable", "0");
+                      } catch (e) { /* ignoré */ }
+                  },
+                  // nombre de notes en attente (appelé par updateStatus)
+                  onPending(n) {
+                      try {
+                          if (!isNative() || n === lastPushedPending) return;
+                          lastPushedPending = n;
+                          if (n === 0) { syncShownThisSession = false; pushState(0, false); }
+                          else pushState(n);
+                      } catch (e) { /* ignoré */ }
+                  },
+                  // déconnexion du prof : plus de rappels, plus de surveillance
+                  async onLogout() {
+                      try {
+                          if (!isNative()) return;
+                          syncShownThisSession = false;
+                          lastPushedPending = 0;
+                          if (LN) await clearReminders();
+                          await setPref("bg_pending", 0);
+                          await setPref("bg_ip", "");
+                          await setPref("bg_last_reachable", "0");
+                      } catch (e) { /* ignoré */ }
+                  }
+              };
+
+              // --- démarrage -------------------------------------------------------------
+              document.addEventListener("DOMContentLoaded", async () => {
+                  try {
+                      if (!isNative()) return;
+                      LN = plugin("LocalNotifications");
+                      PREFS = plugin("Preferences");
+                      if (!ls("sekolify_token")) return;                  // pas encore connecté : rien à planifier
+                      const cached = ls("sekolify_data");
+                      if (cached) await scheduleReminders(cached);        // rappels dispo même sans réseau
+                      const dirty = ls("sekolify_dirty") || {};
+                      lastPushedPending = Object.keys(dirty).length;
+                      await pushState(lastPushedPending);
+                  } catch (e) { /* ignoré */ }
+              });
+          })();
+          JS_NOTIF
+
+          python3 - <<'PY_PATCH'
+          import sys
+
+          def fail(msg):
+              print("ERREUR : " + msg)
+              sys.exit(1)
+
+          # ---- app.js : 5 appels SekNotif (idempotent) ----
+          p = "www/app.js"
+          s = open(p, encoding="utf-8").read()
+          if "SekNotif" in s:
+              print("app.js : deja patche")
+          else:
+              pairs = [
+                  ('        else if ($("view-periods").classList.contains("active")) renderPeriods();\n        if (!silent) showToast("Connexion réussie !");',
+                   '        else if ($("view-periods").classList.contains("active")) renderPeriods();\n        if (window.SekNotif) SekNotif.onConnected(teacherData, pendingCount());   // notifications\n        if (!silent) showToast("Connexion réussie !");'),
+                  ('            teacherData = cached; offlineMode = true; indexGrades(); renderClasses();',
+                   '            teacherData = cached; offlineMode = true; indexGrades(); renderClasses();\n            if (window.SekNotif) SekNotif.onOffline();'),
+                  ('    if (background && lsGet("sekolify_data")) {\n        offlineMode = true;\n        renderClasses();',
+                   '    if (window.SekNotif) SekNotif.onOffline();\n    if (background && lsGet("sekolify_data")) {\n        offlineMode = true;\n        renderClasses();'),
+                  ('    $("btn-sync").disabled = n === 0;\n}',
+                   '    $("btn-sync").disabled = n === 0;\n    if (window.SekNotif) SekNotif.onPending(n);\n}'),
+                  ('    dirty = {}; baseGrades = {}; teacherData = null; nav = { cls: null, period: null, cs: null };\n    setBanner("", false);\n    $("login-error").textContent = "";',
+                   '    dirty = {}; baseGrades = {}; teacherData = null; nav = { cls: null, period: null, cs: null };\n    if (window.SekNotif) SekNotif.onLogout();\n    setBanner("", false);\n    $("login-error").textContent = "";'),
+              ]
+              for old, new in pairs:
+                  if s.count(old) != 1:
+                      fail("www/app.js n'est pas la version attendue (v3). Passage introuvable : " + old.split("\n")[0].strip())
+                  s = s.replace(old, new)
+              open(p, "w", encoding="utf-8").write(s)
+              print("app.js : 5 appels ajoutes")
+
+          # ---- index.html : balise script ----
+          p = "www/index.html"
+          h = open(p, encoding="utf-8").read()
+          if "notifications.js" in h:
+              print("index.html : deja patche")
+          else:
+              a = '<script src="app.js"></script>'
+              if h.count(a) != 1:
+                  fail("balise <script src=\"app.js\"> introuvable dans www/index.html")
+              h = h.replace(a, a + '\n    <script src="notifications.js"></script>')
+              open(p, "w", encoding="utf-8").write(h)
+              print("index.html : balise ajoutee")
+          PY_PATCH
+          grep -c "SekNotif" www/app.js
+
+      - name: Remplacer les emoji par des icônes
+        run: |
+          set -e
+          cat > www/icons.js <<'JS_ICONS'
+          // Icônes (style Lucide, https://lucide.dev — licence ISC) intégrées en SVG : aucune librairie, aucun réseau.
+          // Usage HTML : <i data-icon="check"></i>   Usage JS : icon("check")  ou  icon("loader-circle", "ic-spin")
+          (function () {
+              "use strict";
+              const P = {
+                  "book-open": '<path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/>',
+                  "calendar-days": '<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/><path d="M8 14h.01"/><path d="M12 14h.01"/><path d="M16 14h.01"/><path d="M8 18h.01"/><path d="M12 18h.01"/><path d="M16 18h.01"/>',
+                  "hourglass": '<path d="M5 22h14"/><path d="M5 2h14"/><path d="M17 22v-4.172a2 2 0 0 0-.586-1.414L12 12l-4.414 4.414A2 2 0 0 0 7 17.828V22"/><path d="M7 2v4.172a2 2 0 0 0 .586 1.414L12 12l4.414-4.414A2 2 0 0 0 17 6.172V2"/>',
+                  "rotate-cw": '<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>',
+                  "power": '<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/>',
+                  "arrow-left": '<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>',
+                  "wifi-off": '<path d="M12 20h.01"/><path d="M8.5 16.429a5 5 0 0 1 7 0"/><path d="M5 12.859a10 10 0 0 1 5.17-2.69"/><path d="M19 12.859a10 10 0 0 0-2.007-1.523"/><path d="M2 8.82a15 15 0 0 1 4.177-2.643"/><path d="M22 8.82a15 15 0 0 0-11.288-3.764"/><path d="m2 2 20 20"/>',
+                  "lock": '<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+                  "check": '<path d="M20 6 9 17l-5-5"/>',
+                  "smile": '<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01"/><path d="M15 9h.01"/>',
+                  "loader-circle": '<path d="M21 12a9 9 0 1 1-6.219-8.56"/>',
+                  "search": '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>'
+              };
+
+              function icon(name, extraClass) {
+                  const p = P[name];
+                  if (!p) return "";
+                  return '<svg class="ic' + (extraClass ? " " + extraClass : "") + '" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + p + "</svg>";
+              }
+
+              // remplace chaque <i data-icon="nom"></i> du HTML par le vrai SVG
+              function hydrate(root) {
+                  (root || document).querySelectorAll("i[data-icon]").forEach(el => {
+                      const svg = icon(el.getAttribute("data-icon"), el.getAttribute("data-class"));
+                      if (svg) el.outerHTML = svg;
+                  });
+              }
+
+              window.icon = icon;
+              window.hydrateIcons = hydrate;
+              hydrate();
+          })();
+          JS_ICONS
+
+          if ! grep -q "Icônes (remplacent" www/style.css; then
+            cat >> www/style.css <<'CSS_ICONS'
+
+          /* ---- Icônes (remplacent les emoji) ---- */
+          .ic { width: 1.15em; height: 1.15em; vertical-align: -0.2em; flex-shrink: 0; }
+          .ic-spin { animation: ic-spin 1s linear infinite; }
+          @keyframes ic-spin { to { transform: rotate(360deg); } }
+          .btn-icon { display: inline-flex; align-items: center; justify-content: center; }
+          .btn-icon .ic { width: 1.35rem; height: 1.35rem; vertical-align: middle; }
+          .tab .ic { width: 1.1rem; height: 1.1rem; margin-right: .3rem; vertical-align: -0.22em; }
+          .big-icon { color: var(--accent); margin-bottom: .4rem; line-height: 1; }
+          .big-icon .ic { width: 2.8rem; height: 2.8rem; vertical-align: top; }
+          .banner .ic { width: 1.05rem; height: 1.05rem; vertical-align: -0.2em; }
+          #banner-icon:empty { display: none; }
+          #toast .ic { margin-right: .4rem; vertical-align: -0.22em; }
+          .empty .ic { width: 1.3em; height: 1.3em; margin-right: .3rem; vertical-align: -0.28em; }
+          #sync-text .ic { vertical-align: -0.22em; margin-right: .15rem; }
+          .search { padding-left: 2.4rem; background: #f8fafc url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='11' cy='11' r='8'/><path d='m21 21-4.3-4.3'/></svg>") no-repeat .8rem center / 1.1rem; }
+          CSS_ICONS
+          fi
+
+          python3 - <<'PY_ICONS'
+          import sys
+
+          def fail(msg):
+              print("ERREUR : " + msg)
+              sys.exit(1)
+
+          def patch(path, pairs, marker):
+              s = open(path, encoding="utf-8").read()
+              if marker in s:
+                  print(path + " : deja patche")
+                  return
+              for old, new in pairs:
+                  if s.count(old) != 1:
+                      fail(path + " : passage introuvable ou en double : " + old.split("\n")[0].strip()[:80])
+                  s = s.replace(old, new)
+              open(path, "w", encoding="utf-8").write(s)
+              print(path + " : " + str(len(pairs)) + " remplacements")
+
+          # ---------------- index.html ----------------
+          patch("www/index.html", [
+              ('<script src="app.js"></script>', '<script src="icons.js"></script>\n    <script src="app.js"></script>'),
+              ('<div class="big-emoji">⏳</div>', '<div class="big-icon"><i data-icon="hourglass"></i></div>'),
+              ('aria-label="Actualiser">↻</button>', 'aria-label="Actualiser"><i data-icon="rotate-cw"></i></button>'),
+              ('aria-label="Quitter">⏻</button>', 'aria-label="Quitter"><i data-icon="power"></i></button>'),
+              ('<span id="banner-text"></span>', '<span id="banner-icon"></span>\n            <span id="banner-text"></span>'),
+              ('>📚 Mes classes</button>', '><i data-icon="book-open"></i>Mes classes</button>'),
+              ('>🗓️ Emploi du temps</button>', '><i data-icon="calendar-days"></i>Emploi du temps</button>'),
+              ('placeholder="🔍 Rechercher un élève…"', 'placeholder="Rechercher un élève…"'),
+          ], 'src="icons.js"')
+
+          # la flèche retour apparaît 2 fois : remplacement global
+          s = open("www/index.html", encoding="utf-8").read()
+          s = s.replace('aria-label="Retour">←</button>', 'aria-label="Retour"><i data-icon="arrow-left"></i></button>')
+          open("www/index.html", "w", encoding="utf-8").write(s)
+
+          # ---------------- app.js ----------------
+          patch("www/app.js", [
+              # bannière : icône à côté du texte
+              ('function setBanner(text, withRetry, kind) {\n    $("banner-text").textContent = text;',
+               'function setBanner(text, withRetry, kind, iconName) {\n    $("banner-icon").innerHTML = iconName ? icon(iconName, iconName === "loader-circle" ? "ic-spin" : "") : "";\n    $("banner-text").textContent = text;'),
+              ('setBanner("🔎 Connexion au PC en cours…", false, "info");',
+               'setBanner("Connexion au PC en cours…", false, "info", "loader-circle");'),
+              ('setBanner("📴 " + (err.kind === "nonet" ? "Pas de réseau" : err.kind === "premium" ? "Licence non Premium" : "PC introuvable") + " — mode hors-ligne", true);',
+               'setBanner((err.kind === "nonet" ? "Pas de réseau" : err.kind === "premium" ? "Licence non Premium" : "PC introuvable") + " — mode hors-ligne", true, undefined, "wifi-off");'),
+              ('setBanner("📴 Mode hors-ligne : données enregistrées sur le téléphone", true);',
+               'setBanner("Mode hors-ligne : données enregistrées sur le téléphone", true, undefined, "wifi-off");'),
+              ('setBanner("🔒 " + msg, false);',
+               'setBanner(msg, false, undefined, "lock");'),
+              ('setBanner("📴 PC introuvable — mode hors-ligne", true);',
+               'setBanner("PC introuvable — mode hors-ligne", true, undefined, "wifi-off");'),
+              # toast : icône optionnelle
+              ('function showToast(msg) {\n    const t = $("toast");\n    t.textContent = msg;',
+               'function showToast(msg, iconName) {\n    const t = $("toast");\n    t.innerHTML = (iconName ? icon(iconName) : "") + esc(msg);'),
+              ('showToast("Données à jour ✔");', 'showToast("Données à jour", "check");'),
+              ('showToast(`✔ ${data.synced} note(s) envoyée(s) au PC`);', 'showToast(`${data.synced} note(s) envoyée(s) au PC`, "check");'),
+              # emploi du temps vide
+              ("<p class='empty'>Aucun cours ce ${DAY_NAMES[timetableDay].toLowerCase()} 🎉</p>",
+               "<p class='empty'>${icon(\"smile\")}Aucun cours ce ${DAY_NAMES[timetableDay].toLowerCase()}</p>"),
+              # statut de synchro
+              ('t.textContent = n ? `${n} modification(s) à envoyer` : "Tout est synchronisé ✔";',
+               't.innerHTML = n ? esc(`${n} modification(s) à envoyer`) : icon("check") + "Tout est synchronisé";'),
+          ], "icon(")
+          PY_ICONS
+          grep -n "icons.js" www/index.html
+
+      - name: Ajouter la plateforme Android
+        run: npx cap add android
+
+      - name: Générer l'icône et le splash
+        run: npx capacitor-assets generate --android
+
+      - name: Synchroniser les fichiers web
+        run: npx cap sync android
+
+      - name: Autoriser le trafic HTTP (serveur local du PC)
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          if ! grep -q "usesCleartextTraffic" "$MANIFEST"; then
+            sed -i 's/<application/<application android:usesCleartextTraffic="true"/' "$MANIFEST"
+          fi
+          grep -n "usesCleartextTraffic" "$MANIFEST"
+
+      - name: Ajouter le code natif des notifications
+        run: |
+          set -e
+          PKG_DIR=android/app/src/main/java/com/sekolify/prof
+          if [ ! -f "$PKG_DIR/MainActivity.java" ]; then
+            echo "ERREUR : MainActivity.java introuvable"
+            find android/app/src/main/java -name "*.java"
+            exit 1
+          fi
+
+          cat > "$PKG_DIR/MainActivity.java" <<'JAVA_MAIN'
+          package com.sekolify.prof;
+
+          import android.os.Bundle;
+
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  try {
+                      SyncWatcher.createChannels(this);   // canaux de notification (son d'alarme)
+                      SyncWatcher.schedule(this);         // surveillance du PC en arrière-plan (~15 min)
+                  } catch (Throwable ignored) {
+                      // ne jamais empêcher l'app de démarrer
+                  }
+              }
+          }
+          JAVA_MAIN
+
+          cat > "$PKG_DIR/SyncWatcher.java" <<'JAVA_SYNC'
+          package com.sekolify.prof;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.media.AudioAttributes;
+          import android.media.AudioManager;
+          import android.net.Uri;
+          import android.os.Build;
+
+          import androidx.annotation.NonNull;
+          import androidx.core.app.NotificationCompat;
+          import androidx.work.ExistingPeriodicWorkPolicy;
+          import androidx.work.PeriodicWorkRequest;
+          import androidx.work.WorkManager;
+          import androidx.work.Worker;
+          import androidx.work.WorkerParameters;
+
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.concurrent.TimeUnit;
+
+          /**
+           * Surveille le PC de l'école en arrière-plan (même app fermée).
+           * Toutes les ~15 min : s'il reste des notes non envoyées ET que le PC répond,
+           * une notification sonore invite le prof à synchroniser (une seule fois par épisode).
+           *
+           * L'état (IP du PC, nombre de notes en attente) est écrit par l'app web dans
+           * les SharedPreferences "CapacitorStorage" via le plugin @capacitor/preferences.
+           */
+          public class SyncWatcher extends Worker {
+
+              static final String CH_COURS = "cours_v1";
+              static final String CH_SYNC = "sync_v1";
+              private static final String WORK_NAME = "sekolify_sync_watch";
+              private static final String PREFS = "CapacitorStorage";
+              private static final int NOTIF_SYNC_ID = 9001;
+
+              public SyncWatcher(@NonNull Context context, @NonNull WorkerParameters params) {
+                  super(context, params);
+              }
+
+              // ---------------------------------------------------------------- canaux
+
+              static void createChannels(Context ctx) {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+                  NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+
+                  Uri sound = soundUri(ctx);
+                  AudioAttributes attrs = new AudioAttributes.Builder()
+                          .setUsage(AudioAttributes.USAGE_ALARM)                  // son « imposé » : volume alarme
+                          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                          .build();
+
+                  makeChannel(nm, CH_COURS, "Rappels de cours", "Rappel 10 minutes avant chaque cours", sound, attrs);
+                  makeChannel(nm, CH_SYNC, "Synchronisation des notes", "Alerte quand le PC de l'école est joignable", sound, attrs);
+              }
+
+              private static void makeChannel(NotificationManager nm, String id, String name, String desc,
+                                              Uri sound, AudioAttributes attrs) {
+                  NotificationChannel c = new NotificationChannel(id, name, NotificationManager.IMPORTANCE_HIGH);
+                  c.setDescription(desc);
+                  c.setSound(sound, attrs);
+                  c.enableVibration(true);
+                  c.setVibrationPattern(new long[]{0, 500, 250, 500, 250, 800});
+                  c.enableLights(true);
+                  c.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                  nm.createNotificationChannel(c);
+              }
+
+              private static Uri soundUri(Context ctx) {
+                  return Uri.parse("android.resource://" + ctx.getPackageName() + "/raw/alerte");
+              }
+
+              // ---------------------------------------------------------- planification
+
+              static void schedule(Context ctx) {
+                  // Pas de contrainte réseau volontairement : un Wi-Fi local sans internet
+                  // n'est pas « validé » par Android et bloquerait la tâche.
+                  PeriodicWorkRequest req = new PeriodicWorkRequest.Builder(SyncWatcher.class, 15, TimeUnit.MINUTES).build();
+                  WorkManager.getInstance(ctx).enqueueUniquePeriodicWork(WORK_NAME, ExistingPeriodicWorkPolicy.KEEP, req);
+              }
+
+              // ----------------------------------------------------------------- travail
+
+              @NonNull
+              @Override
+              public Result doWork() {
+                  try {
+                      Context ctx = getApplicationContext();
+                      SharedPreferences sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+
+                      int pending = toInt(sp.getString("bg_pending", "0"), 0);
+                      String ip = sp.getString("bg_ip", "");
+                      int port = toInt(sp.getString("bg_port", "47831"), 47831);
+                      boolean last = "1".equals(sp.getString("bg_last_reachable", "0"));
+
+                      if (pending <= 0 || ip == null || ip.isEmpty()) {
+                          if (last) sp.edit().putString("bg_last_reachable", "0").apply();   // nouvel épisode au prochain ajout de notes
+                          return Result.success();
+                      }
+
+                      boolean reachable = probe(ip, port);
+                      if (reachable && !last) notifySync(ctx, pending);
+                      if (reachable != last) sp.edit().putString("bg_last_reachable", reachable ? "1" : "0").apply();
+                  } catch (Throwable ignored) {
+                      // on réessaiera au prochain passage
+                  }
+                  return Result.success();
+              }
+
+              private static int toInt(String s, int def) {
+                  try { return Integer.parseInt(s.trim()); } catch (Exception e) { return def; }
+              }
+
+              private static boolean probe(String ip, int port) {
+                  HttpURLConnection c = null;
+                  try {
+                      c = (HttpURLConnection) new URL("http://" + ip + ":" + port + "/hello").openConnection();
+                      c.setConnectTimeout(2500);
+                      c.setReadTimeout(2500);
+                      c.setRequestMethod("GET");
+                      if (c.getResponseCode() != 200) return false;
+                      BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"));
+                      StringBuilder sb = new StringBuilder();
+                      String line;
+                      while ((line = r.readLine()) != null && sb.length() < 2000) sb.append(line);
+                      r.close();
+                      return sb.toString().contains("sekolify");
+                  } catch (Exception e) {
+                      return false;
+                  } finally {
+                      if (c != null) c.disconnect();
+                  }
+              }
+
+              private static void notifySync(Context ctx, int pending) {
+                  createChannels(ctx);
+                  NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+
+                  Intent open = new Intent(ctx, MainActivity.class);
+                  open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(ctx, 0, open,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+                  String text = pending + " note(s) non envoyée(s). Il est temps de synchroniser les notes de vos élèves.";
+                  NotificationCompat.Builder b = new NotificationCompat.Builder(ctx, CH_SYNC)
+                          .setSmallIcon(R.drawable.ic_stat_notify)
+                          .setContentTitle("Connecté au serveur de l'école")
+                          .setContentText(text)
+                          .setStyle(new NotificationCompat.BigTextStyle().bigText(text))
+                          .setPriority(NotificationCompat.PRIORITY_HIGH)
+                          .setCategory(NotificationCompat.CATEGORY_REMINDER)
+                          .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                          .setAutoCancel(true)
+                          .setContentIntent(pi);
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {          // avant Android 8 : pas de canaux
+                      b.setSound(soundUri(ctx), AudioManager.STREAM_ALARM);
+                      b.setVibrate(new long[]{0, 500, 250, 500, 250, 800});
+                  }
+                  nm.notify(NOTIF_SYNC_ID, b.build());
+              }
+          }
+          JAVA_SYNC
+
+          mkdir -p android/app/src/main/res/raw android/app/src/main/res/drawable
+          cat > android/app/src/main/res/drawable/ic_stat_notify.xml <<'XML_ICON'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:pathData="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="2"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:fillColor="#00000000"/>
+              <path
+                  android:pathData="M10.3 21a1.94 1.94 0 0 0 3.4 0"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="2"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:fillColor="#00000000"/>
+          </vector>
+          XML_ICON
+          python3 - <<'PY'
+          import wave, struct, math
+          sr = 22050
+          def tone(freq, dur, vol=0.9, decay=3.0):
+              n = int(sr * dur); out = []
+              for i in range(n):
+                  t = i / sr
+                  env = min(1, i / (sr * 0.005)) * math.exp(-decay * t / dur * 1.5)
+                  v = math.sin(2*math.pi*freq*t) + 0.45*math.sin(2*math.pi*freq*2*t) + 0.2*math.sin(2*math.pi*freq*3*t)
+                  out.append(vol * env * v / 1.65)
+              return out
+          def silence(d): return [0.0] * int(sr * d)
+          seq = []
+          for k in range(3):
+              seq += tone(880, 0.38) + tone(1318.5, 0.38) + tone(1760, 0.55) + silence(0.35)
+          w = wave.open("android/app/src/main/res/raw/alerte.wav", "wb")
+          w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+          w.writeframes(b"".join(struct.pack("<h", int(max(-1, min(1, x)) * 32000)) for x in seq))
+          w.close()
+          PY
+          ls -la android/app/src/main/res/raw
+
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          for P in POST_NOTIFICATIONS SCHEDULE_EXACT_ALARM VIBRATE RECEIVE_BOOT_COMPLETED WAKE_LOCK; do
+            if ! grep -q "android.permission.$P\"" "$MANIFEST"; then
+              sed -i "s#</manifest>#    <uses-permission android:name=\"android.permission.$P\" />\n</manifest>#" "$MANIFEST"
+            fi
+          done
+          grep -n "uses-permission" "$MANIFEST"
+
+          cat >> android/app/build.gradle <<'GRADLE'
+
+          dependencies {
+              implementation "androidx.work:work-runtime:2.9.0"
+          }
+          android {
+              lint {
+                  abortOnError false
+                  checkReleaseBuilds false
+              }
+          }
+          GRADLE
+          tail -n 14 android/app/build.gradle
+
+      - name: Configurer la signature avec le keystore
+        run: |
+          KS="$RUNNER_TEMP/sekolify-prof.jks"
+          base64 -d > "$KS" <<'B64'
+          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
+          c5MElLjC
+          B64
+          echo "Keystore reconstruit :"
+          ls -la "$KS"
+          keytool -list -keystore "$KS" -storepass sekolify2026 | grep -E "entry|Entry"
+          cat >> android/app/build.gradle <<EOF
+
+          android {
+              signingConfigs {
+                  release {
+                      storeFile file("$KS")
+                      storePassword "sekolify2026"
+                      keyAlias "sekolify"
+                      keyPassword "sekolify2026"
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                  }
+              }
+          }
+          EOF
+          tail -n 20 android/app/build.gradle
+
+      - name: Compiler l'APK (release signé)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Vérifier la signature
+        run: |
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          ls -la "$APK"
+          "$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs "$APK" | head -n 5
+
+      - name: Publier l'APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sekolify-Prof-APK
+          path: android/app/build/outputs/apk/release/app-release.apk
